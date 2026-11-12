@@ -1,0 +1,88 @@
+name: SEBI AIF Monitor
+
+on:
+  schedule:
+    # Every 30 min, 24/7 (UTC). Minutes 7 and 37 avoid the :00 rush, when
+    # GitHub delays or drops the most scheduled jobs.
+    - cron: "7,37 * * * *"
+  workflow_dispatch:
+    inputs:
+      test_latest:
+        description: "Send a test alert for the N newest AIF items (ignores memory). 0 = normal run."
+        required: false
+        default: "0"
+      dry_run:
+        description: "Dry run (no email, no state commit; outputs uploaded as artifact)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # needed to commit seen_notifications.json back
+
+concurrency:
+  group: sebi-aif-monitor
+  cancel-in-progress: false   # never run two copies against the same state file
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+        # Playwright uses the Google Chrome already installed on ubuntu-latest,
+        # so no browser download is needed on most runs.
+
+      - name: Run monitor
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          TEST_LATEST: ${{ github.event.inputs.test_latest || '0' }}
+          TZ: Asia/Kolkata
+        run: |
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            python monitor.py --dry-run
+          else
+            python monitor.py
+          fi
+
+      - name: Upload outputs (infographics, debug)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sebi-outputs-${{ github.run_id }}
+          path: out/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Commit state
+        if: github.event.inputs.dry_run != 'true'
+        run: |
+          git config user.name  "sebi-aif-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          [ -f seen_notifications.json ] || { echo "No state file yet."; exit 0; }
+          git add seen_notifications.json
+          if git diff --cached --quiet; then
+            echo "State unchanged - nothing to commit."
+            exit 0
+          fi
+          git commit -m "chore(state): update seen notifications [skip ci]"
+          for i in 1 2 3; do
+            git pull --rebase --autostash && git push && exit 0
+            sleep 5
+          done
+          echo "::error::Could not push state after 3 attempts"
+          exit 1
